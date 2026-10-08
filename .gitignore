@@ -1,0 +1,45 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data - never commit raw data
+data/raw/
+data/processed/
+data/interim/
+
+# Model artifacts
+*.pt
+*.bin
+*.pkl
+*.joblib
+models/artifacts/
+
+# MLflow (local runs)
+mlruns/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Reports (generated)
+reports/figures/*.png
+reports/figures/*.html
+
+# IDE
+.vscode/
+.idea/
