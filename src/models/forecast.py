@@ -4,52 +4,76 @@ Also computes reorder points and safety stock from forecast + uncertainty.
 """
 
 import os
+import math
 import logging
 import numpy as np
 import pandas as pd
+import mlflow
 import mlflow.pyfunc
 import mlflow.pytorch
 from dotenv import load_dotenv
+from src.config import FEATURE_COLS
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-FEATURE_COLS = [
-    "store", "item", "dayofweek", "dayofmonth", "month", "quarter",
-    "weekofyear", "year", "is_weekend", "month_sin", "month_cos",
-    "dow_sin", "dow_cos", "is_holiday", "is_day_before_holiday",
-    "is_day_after_holiday", "trend",
-    "lag_7", "lag_14", "lag_21", "lag_28", "lag_91", "lag_182", "lag_364",
-    "rolling_mean_7", "rolling_mean_14", "rolling_mean_28", "rolling_mean_91",
-    "rolling_std_7", "rolling_std_14", "rolling_std_28", "rolling_std_91",
-    "expanding_mean", "expanding_std",
-]
-
-
-# Map registered model names → relative artifact paths (avoids cross-OS registry URI issues)
-_MODEL_PATHS = {
-    "demandsense-lightgbm": "mlruns/1/8cbf0ac803c542f2a8a5be2690936a5f/artifacts/model",
-    "demandsense-xgboost":  "mlruns/1/38b7c04e584c4243be5b968aa16c34ef/artifacts/model",
-    "demandsense-lstm":     "mlruns/1/1bd18ed4d82246959a13af4e407a2c78/artifacts/model",
-}
-
 _LSTM_MODELS = {"demandsense-lstm"}
+_VALID_MODELS = {"demandsense-lightgbm", "demandsense-xgboost", "demandsense-lstm"}
+_model_cache: dict = {}
 
 
-def load_model(model_name: str = "demandsense-lightgbm", stage: str = "None"):
-    """Load MLflow model by direct artifact path (works cross-platform)."""
-    import pathlib
-    project_root = pathlib.Path(__file__).resolve().parents[2]
-    rel_path = _MODEL_PATHS.get(model_name)
-    if rel_path is None:
-        raise ValueError(f"Unknown model name: {model_name!r}. Choose from {list(_MODEL_PATHS)}")
-    artifact_path = project_root / rel_path
-    if not artifact_path.exists():
-        raise FileNotFoundError(f"Model artifact not found at {artifact_path}")
-    logger.info(f"Loading model: {model_name} from {artifact_path}")
+def load_model(model_name: str = "demandsense-lightgbm"):
+    """Load MLflow model from registry with caching."""
+    if model_name in _model_cache:
+        return _model_cache[model_name]
+
+    if model_name not in _VALID_MODELS:
+        raise ValueError(f"Unknown model: {model_name!r}. Choose from {sorted(_VALID_MODELS)}")
+
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlruns/mlflow.db")
+    mlflow.set_tracking_uri(tracking_uri)
+
+    uri = f"models:/{model_name}/latest"
+    logger.info(f"Loading model: {model_name}")
+
+    try:
+        if model_name in _LSTM_MODELS:
+            model = mlflow.pytorch.load_model(uri, map_location="cpu")
+        else:
+            model = mlflow.pyfunc.load_model(uri)
+    except Exception:
+        logger.warning(f"Registry lookup failed for {model_name}, searching runs...")
+        model = _load_from_latest_run(model_name)
+
+    _model_cache[model_name] = model
+    return model
+
+
+def _load_from_latest_run(model_name: str):
+    """Fallback: find the latest training run and load from its artifacts."""
+    experiment = mlflow.get_experiment_by_name(
+        os.getenv("MLFLOW_EXPERIMENT_NAME", "demandsense-forecasting")
+    )
+    if experiment is None:
+        raise FileNotFoundError(f"No MLflow experiment found for {model_name}")
+
+    run_name = model_name.replace("demandsense-", "")
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=f"tags.mlflow.runName = '{run_name}'",
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if runs.empty:
+        raise FileNotFoundError(f"No runs found for {model_name}")
+
+    run_id = runs.iloc[0].run_id
+    artifact_uri = f"runs:/{run_id}/model"
+    logger.info(f"Loading {model_name} from run {run_id}")
+
     if model_name in _LSTM_MODELS:
-        return mlflow.pytorch.load_model(str(artifact_path), map_location="cpu")
-    return mlflow.pyfunc.load_model(str(artifact_path))
+        return mlflow.pytorch.load_model(artifact_uri, map_location="cpu")
+    return mlflow.pyfunc.load_model(artifact_uri)
 
 
 def generate_future_dates(start_date: str, horizon: int = 90) -> pd.DatetimeIndex:
@@ -57,16 +81,8 @@ def generate_future_dates(start_date: str, horizon: int = 90) -> pd.DatetimeInde
     return pd.date_range(start=start_date, periods=horizon, freq="D")
 
 
-def build_forecast_frame(
-    df: pd.DataFrame,
-    store: int,
-    item: int,
-    horizon: int = 90,
-) -> pd.DataFrame:
-    """
-    Build a feature-ready DataFrame for a future forecast window.
-    Uses last known lags from training data, then propagates recursively.
-    """
+def _predict_tree_recursive(model, df: pd.DataFrame, store: int, item: int, horizon: int) -> np.ndarray:
+    """Row-by-row tree model prediction with recursive lag updates."""
     import holidays as hol
 
     series = df[(df["store"] == store) & (df["item"] == item)].sort_values("date")
@@ -75,16 +91,15 @@ def build_forecast_frame(
         (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), horizon
     )
 
-    rows = []
     sales_history = series["sales"].values.tolist()
-
     us_holidays = hol.US(years=future_dates.year.unique().tolist())
     holiday_dates = set(us_holidays.keys())
+    min_date = df["date"].min()
 
-    for i, d in enumerate(future_dates):
+    preds = []
+    for d in future_dates:
         n = len(sales_history)
         row = {
-            "date": d,
             "store": store,
             "item": item,
             "dayofweek": d.dayofweek,
@@ -101,18 +116,16 @@ def build_forecast_frame(
             "is_holiday": int(d.date() in holiday_dates),
             "is_day_before_holiday": int((d + pd.Timedelta(days=1)).date() in holiday_dates),
             "is_day_after_holiday": int((d - pd.Timedelta(days=1)).date() in holiday_dates),
-            "trend": (d - df["date"].min()).days,
-            # Lags — look back into history + previously predicted values
-            "lag_7":   sales_history[n - 7]   if n >= 7   else np.nan,
-            "lag_14":  sales_history[n - 14]  if n >= 14  else np.nan,
-            "lag_21":  sales_history[n - 21]  if n >= 21  else np.nan,
-            "lag_28":  sales_history[n - 28]  if n >= 28  else np.nan,
-            "lag_91":  sales_history[n - 91]  if n >= 91  else np.nan,
-            "lag_182": sales_history[n - 182] if n >= 182 else np.nan,
-            "lag_364": sales_history[n - 364] if n >= 364 else np.nan,
+            "trend": (d - min_date).days,
+            "lag_7":   sales_history[n - 7]   if n >= 7   else 0,
+            "lag_14":  sales_history[n - 14]  if n >= 14  else 0,
+            "lag_21":  sales_history[n - 21]  if n >= 21  else 0,
+            "lag_28":  sales_history[n - 28]  if n >= 28  else 0,
+            "lag_91":  sales_history[n - 91]  if n >= 91  else 0,
+            "lag_182": sales_history[n - 182] if n >= 182 else 0,
+            "lag_364": sales_history[n - 364] if n >= 364 else 0,
         }
 
-        # Rolling statistics on available history
         for w in [7, 14, 28, 91]:
             window = sales_history[max(0, n - w):]
             row[f"rolling_mean_{w}"] = np.mean(window) if window else 0
@@ -121,11 +134,12 @@ def build_forecast_frame(
         row["expanding_mean"] = np.mean(sales_history)
         row["expanding_std"] = np.std(sales_history) if len(sales_history) > 1 else 0
 
-        rows.append(row)
-        # Placeholder for the next iteration's lag (will be filled by model prediction)
-        sales_history.append(0)  # updated after prediction below
+        row_df = pd.DataFrame([row])
+        pred = max(model.predict(row_df[FEATURE_COLS])[0], 0)
+        preds.append(pred)
+        sales_history.append(pred)
 
-    return pd.DataFrame(rows)
+    return np.array(preds)
 
 
 def _predict_lstm(
@@ -148,8 +162,7 @@ def _predict_lstm(
         for _ in range(horizon):
             seq = np.array(history[-SEQ_LEN:], dtype=np.float32).reshape(1, SEQ_LEN, 1)
             x = torch.tensor(seq)
-            pred = model(x).item()
-            pred = max(pred, 0)
+            pred = max(model(x).item(), 0)
             preds.append(pred)
             history.append(pred)
     return np.array(preds)
@@ -177,19 +190,17 @@ def predict(
 
     if model_name in _LSTM_MODELS:
         preds = _predict_lstm(model, df, store, item, horizon)
-        forecast_df = pd.DataFrame({
-            "date": future_dates,
-            "store": store,
-            "item": item,
-        })
     else:
-        forecast_df = build_forecast_frame(df, store, item, horizon)
-        X = forecast_df[FEATURE_COLS].fillna(0)
-        preds = np.maximum(model.predict(X), 0)
+        preds = _predict_tree_recursive(model, df, store, item, horizon)
 
-    forecast_df["predicted_sales"] = preds
-    forecast_df["lower_bound"] = np.maximum(preds - 1.64 * sigma, 0)
-    forecast_df["upper_bound"] = preds + 1.64 * sigma
+    forecast_df = pd.DataFrame({
+        "date": future_dates,
+        "store": store,
+        "item": item,
+        "predicted_sales": preds,
+        "lower_bound": np.maximum(preds - 1.64 * sigma, 0),
+        "upper_bound": preds + 1.64 * sigma,
+    })
 
     return forecast_df[["date", "store", "item", "predicted_sales", "lower_bound", "upper_bound"]]
 
@@ -214,6 +225,8 @@ def compute_inventory_recommendations(
     reorder_point = avg_daily * lead_time_days + safety_stock
     total_90d = forecast_df["predicted_sales"].sum()
 
+    service_level_pct = round(0.5 * (1 + math.erf(service_level_z / math.sqrt(2))) * 100, 1)
+
     return {
         "avg_daily_demand": round(avg_daily, 2),
         "demand_std": round(sigma, 2),
@@ -221,5 +234,5 @@ def compute_inventory_recommendations(
         "reorder_point": round(reorder_point, 2),
         "total_forecast_90d": round(total_90d, 2),
         "lead_time_days": lead_time_days,
-        "service_level_pct": round(service_level_z * 100 / 1.65 * 95 / 100, 1),
+        "service_level_pct": service_level_pct,
     }

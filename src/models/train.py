@@ -13,21 +13,10 @@ import mlflow.sklearn
 import mlflow.pytorch
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from dotenv import load_dotenv
+from src.config import FEATURE_COLS, TARGET_COL
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-FEATURE_COLS = [
-    "store", "item", "dayofweek", "dayofmonth", "month", "quarter",
-    "weekofyear", "year", "is_weekend", "month_sin", "month_cos",
-    "dow_sin", "dow_cos", "is_holiday", "is_day_before_holiday",
-    "is_day_after_holiday", "trend",
-    "lag_7", "lag_14", "lag_21", "lag_28", "lag_91", "lag_182", "lag_364",
-    "rolling_mean_7", "rolling_mean_14", "rolling_mean_28", "rolling_mean_91",
-    "rolling_std_7", "rolling_std_14", "rolling_std_28", "rolling_std_91",
-    "expanding_mean", "expanding_std",
-]
-TARGET_COL = "sales"
 
 
 # ── Metrics ──────────────────────────────────────────────────────────────────
@@ -46,7 +35,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 # ── Time-series CV splitter ───────────────────────────────────────────────────
 
-def ts_cv_splits(df: pd.DataFrame, n_splits: int = 5, gap_days: int = 0):
+def ts_cv_splits(df: pd.DataFrame, n_splits: int = 5):
     """
     Expanding-window time-series cross-validation.
     Yields (train_idx, val_idx) pairs with strictly forward-looking validation sets.
@@ -181,9 +170,14 @@ def train_lightgbm(df: pd.DataFrame, experiment_name: str) -> str:
         avg = {k: round(np.mean([m[k] for m in all_metrics]), 4) for k in ["mae", "rmse", "wape"]}
         mlflow.log_metrics({f"cv_{k}": v for k, v in avg.items()})
 
-        # Final model on full dataset
+        # Final model — use last CV fold as eval set for early stopping
+        last_train_idx, last_val_idx = list(ts_cv_splits(df))[-1]
         final_model = lgb.LGBMRegressor(**params)
-        final_model.fit(df[FEATURE_COLS], df[TARGET_COL])
+        final_model.fit(
+            df[FEATURE_COLS], df[TARGET_COL],
+            eval_set=[(df.loc[last_val_idx, FEATURE_COLS], df.loc[last_val_idx, TARGET_COL])],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)],
+        )
 
         mlflow.lightgbm.log_model(
             final_model,
@@ -212,26 +206,6 @@ def build_lstm_sequences(df: pd.DataFrame, seq_len: int = 28):
     return torch.tensor(X), torch.tensor(y, dtype=torch.float32)
 
 
-class LSTMForecaster(object if True else None):
-    """Simple 2-layer LSTM for univariate demand forecasting."""
-
-    def __new__(cls, *args, **kwargs):
-        import torch.nn as nn
-
-        class _Model(nn.Module):
-            def __init__(self, hidden=64, num_layers=2, dropout=0.2):
-                super().__init__()
-                self.lstm = nn.LSTM(1, hidden, num_layers, batch_first=True, dropout=dropout)
-                self.fc = nn.Linear(hidden, 1)
-
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                return self.fc(out[:, -1, :]).squeeze(1)
-
-        instance = _Model(*args, **kwargs)
-        return instance
-
-
 def train_lstm(df: pd.DataFrame, experiment_name: str, epochs: int = 20) -> str:
     """Train LSTM neural forecaster; log to MLflow."""
     import torch
@@ -257,8 +231,6 @@ def train_lstm(df: pd.DataFrame, experiment_name: str, epochs: int = 20) -> str:
     val_loader = DataLoader(val_ds, batch_size=BATCH)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    import torch.nn as nn
 
     class LSTMModel(nn.Module):
         def __init__(self):

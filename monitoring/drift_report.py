@@ -7,22 +7,12 @@ import os
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import mlflow
 from dotenv import load_dotenv
+from src.config import FEATURE_COLS
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-FEATURE_COLS = [
-    "store", "item", "dayofweek", "dayofmonth", "month", "quarter",
-    "weekofyear", "year", "is_weekend", "month_sin", "month_cos",
-    "dow_sin", "dow_cos", "is_holiday", "is_day_before_holiday",
-    "is_day_after_holiday", "trend",
-    "lag_7", "lag_14", "lag_21", "lag_28", "lag_91", "lag_182", "lag_364",
-    "rolling_mean_7", "rolling_mean_14", "rolling_mean_28", "rolling_mean_91",
-    "rolling_std_7", "rolling_std_14", "rolling_std_28", "rolling_std_91",
-    "expanding_mean", "expanding_std",
-]
 
 
 def load_reference_and_current(
@@ -116,7 +106,6 @@ def run_model_performance_report(
     Score the current window and compute live MAE, RMSE, WAPE.
     Logs metrics to MLflow for trend tracking.
     """
-    import mlflow
     import mlflow.pyfunc
 
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlruns/mlflow.db")
@@ -134,6 +123,7 @@ def run_model_performance_report(
     metrics = {"live_mae": round(mae, 4), "live_rmse": round(rmse, 4), "live_wape": round(wape, 4)}
 
     experiment = os.getenv("MLFLOW_EXPERIMENT_NAME", "demandsense-forecasting")
+    mlflow.set_experiment(experiment)
     with mlflow.start_run(run_name="monitoring_check"):
         mlflow.log_metrics(metrics)
         mlflow.log_param("model_name", model_name)

@@ -6,6 +6,7 @@ Endpoints: /predict, /health, /metrics, /inventory
 import os
 import time
 import logging
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -25,7 +26,7 @@ _model = None
 _data: Optional[pd.DataFrame] = None
 _request_count = 0
 _error_count = 0
-_latencies = []
+_latencies: deque = deque(maxlen=1000)
 
 
 def get_model():
@@ -124,7 +125,7 @@ def health():
 
 @app.get("/metrics")
 def metrics():
-    avg_latency = round(np.mean(_latencies[-100:]), 3) if _latencies else 0
+    avg_latency = round(np.mean(list(_latencies)), 3) if _latencies else 0
     return {
         "request_count": _request_count,
         "error_count": _error_count,
@@ -181,7 +182,7 @@ def predict(req: ForecastRequest):
     except Exception as e:
         _error_count += 1
         logger.exception("Prediction failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Prediction failed. Check server logs.")
 
 
 @app.get("/stores")
